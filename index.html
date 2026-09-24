@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Skill Practice Zone — Mic Bridge</title>
+<style>
+  body {
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #14101c; color: #fff; margin: 0; height: 100vh; box-sizing: border-box;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 14px; text-align: center; padding: 20px;
+  }
+  h1 { font-size: 15px; margin: 0; font-weight: 700; }
+  #dot { width: 14px; height: 14px; border-radius: 50%; background: #64748b; transition: background 150ms; }
+  #dot.listening { background: #f59e0b; }
+  #dot.speaking { background: #6ecb63; animation: pulse 1.1s ease-in-out infinite; }
+  @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(110,203,99,0.5); } 50% { box-shadow: 0 0 0 10px rgba(110,203,99,0); } }
+  #status { font-size: 13px; opacity: 0.85; max-width: 280px; }
+</style>
+</head>
+<body>
+  <h1>🎙️ Skill Practice Zone — Mic Bridge</h1>
+  <div id="dot"></div>
+  <div id="status">Requesting microphone access&hellip;</div>
+  <script>
+    // Generic, continuous-listening mic-capture bridge for the practice
+    // page, whose own frame can't call getUserMedia() directly -- Google
+    // Apps Script's HtmlService wraps app content in a nested iframe that
+    // omits "microphone" from that iframe's Permissions Policy allow-list.
+    // A popup opened via window.open() is a genuine top-level browsing
+    // context and is exempt from that restriction, so it can request the
+    // mic and relay recorded clips back to the opener via postMessage.
+    // This page holds no secrets and does not log, store, or transmit
+    // audio anywhere else -- it only ever talks to window.opener. Adapted
+    // from the same proven pattern used by the sibling NHForm project.
+    //
+    // Listens once told to (START_LISTENING) -- a Web-Audio voice-activity
+    // detector reports speaking/listening state for the opener app's UI
+    // (e.g. "Listening…"/"Hearing you…"), but silence never ends a segment
+    // on its own. A segment only ends on an explicit STOP_LISTENING
+    // message (the opener's manual "Send" action) or the MAX_SEGMENT_MS
+    // safety cap below.
+    var opener = window.opener;
+    var stream = null;
+    var audioContext = null;
+    var analyser = null;
+    var mediaRecorder = null;
+    var chunks = [];
+    var vadState = 'idle';
+    var segmentStartedAt = null;
+    var vadTimer = null;
+    var silenceThreshold = 0.02;
+
+    var MAX_SEGMENT_MS = 180000; // 3 minutes -- safety cap on a single Talk/Send recording segment
+    var VAD_POLL_MS = 50;
+
+    function setStatus(text) { document.getElementById('status').textContent = text; }
+    function setDot(state) { document.getElementById('dot').className = state === 'idle' ? '' : state; }
+    function post(msg) { if (opener) opener.postMessage(msg, '*'); }
+
+    if (!opener) {
+      setStatus('This page must be opened as a popup from Skill Practice Zone.');
+    } else if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setStatus('Microphone access is not supported in this browser.');
+      post({ type: 'BRIDGE_ERROR', message: 'getUserMedia unsupported in this browser' });
+    } else {
+      navigator.mediaDevices.getUserMedia({ audio: true })
+        .then(function(s) {
+          stream = s;
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          var source = audioContext.createMediaStreamSource(stream);
+          analyser = audioContext.createAnalyser();
+          analyser.fftSize = 2048;
+          source.connect(analyser);
+          calibrateSilenceThreshold_(function() {
+            setStatus('Microphone ready. Waiting for the app…');
+            post({ type: 'BRIDGE_READY' });
+          });
+        })
+        .catch(function(err) {
+          setStatus('Microphone permission denied: ' + (err && err.message ? err.message : err));
+          post({ type: 'BRIDGE_ERROR', message: (err && err.message) || String(err) });
+        });
+    }
+
+    function calibrateSilenceThreshold_(done) {
+      var samples = [];
+      var start = Date.now();
+      var interval = setInterval(function() {
+        samples.push(currentVolume_());
+        if (Date.now() - start >= 500) {
+          clearInterval(interval);
+          var avg = samples.reduce(function(a, b) { return a + b; }, 0) / samples.length;
+          if (avg > 0 && avg < 0.05) {
+            silenceThreshold = avg * 2.5 + 0.01;
+          }
+          done();
+        }
+      }, VAD_POLL_MS);
+    }
+
+    function currentVolume_() {
+      var data = new Uint8Array(analyser.fftSize);
+      analyser.getByteTimeDomainData(data);
+      var sumSquares = 0;
+      for (var i = 0; i < data.length; i++) {
+        var normalized = (data[i] - 128) / 128;
+        sumSquares += normalized * normalized;
+      }
+      return Math.sqrt(sumSquares / data.length);
+    }
+
+    window.addEventListener('message', function(event) {
+      if (event.source !== opener) return;
+      var msg = event.data || {};
+      if (msg.type === 'START_LISTENING') startListening_();
+      else if (msg.type === 'STOP_LISTENING') finishSegment_();
+      else if (msg.type === 'PAUSE_LISTENING') pauseListening_();
+      else if (msg.type === 'CLOSE') window.close();
+    });
+
+    function startListening_() {
+      if (vadState !== 'idle' || !stream) return;
+      chunks = [];
+      segmentStartedAt = Date.now();
+      try {
+        mediaRecorder = new MediaRecorder(stream);
+      } catch (e) {
+        post({ type: 'BRIDGE_ERROR', message: 'MediaRecorder unsupported: ' + e.message });
+        return;
+      }
+      mediaRecorder.ondataavailable = function(e) {
+        if (e.data && e.data.size > 0) chunks.push(e.data);
+      };
+      mediaRecorder.onstop = function() {
+        var blob = new Blob(chunks, { type: mediaRecorder.mimeType || 'audio/webm' });
+        var reader = new FileReader();
+        reader.onloadend = function() {
+          post({
+            type: 'AUDIO_CAPTURE_SUCCESS',
+            base64DataUrl: reader.result,
+            mimeType: mediaRecorder.mimeType || 'audio/webm'
+          });
+        };
+        reader.readAsDataURL(blob);
+      };
+      mediaRecorder.start();
+      vadState = 'listening';
+      setDot('listening');
+      setStatus('Listening…');
+      post({ type: 'VAD_STATE', state: 'listening' });
+      vadTimer = setInterval(pollVoiceActivity_, VAD_POLL_MS);
+    }
+
+    function pauseListening_() {
+      if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.ondataavailable = null;
+        mediaRecorder.onstop = null;
+        mediaRecorder.stop();
+      }
+      vadState = 'idle';
+      setDot('idle');
+      setStatus('Paused.');
+    }
+
+    function pollVoiceActivity_() {
+      var volume = currentVolume_();
+      var speaking = volume > silenceThreshold;
+
+      // Status-only: reports speaking/listening for the opener's UI. Never
+      // ends the segment on its own -- a pause to think or breathe must
+      // not cut the recording short. Only STOP_LISTENING (Send) or the
+      // MAX_SEGMENT_MS cap below does that.
+      if (speaking) {
+        if (vadState !== 'speaking') {
+          vadState = 'speaking';
+          setDot('speaking');
+          post({ type: 'VAD_STATE', state: 'speaking' });
+        }
+      } else if (vadState === 'speaking') {
+        vadState = 'listening';
+        setDot('listening');
+        post({ type: 'VAD_STATE', state: 'listening' });
+      }
+
+      if (Date.now() - segmentStartedAt >= MAX_SEGMENT_MS) {
+        finishSegment_();
+      }
+    }
+
+    function finishSegment_() {
+      if (vadTimer) { clearInterval(vadTimer); vadTimer = null; }
+      vadState = 'idle';
+      setDot('idle');
+      setStatus('Sending to the app…');
+      if (mediaRecorder && mediaRecorder.state === 'recording') {
+        mediaRecorder.stop();
+      }
+    }
+
+    window.addEventListener('beforeunload', function() {
+      if (vadTimer) clearInterval(vadTimer);
+      if (stream) stream.getTracks().forEach(function(t) { t.stop(); });
+    });
+  </script>
+</body>
+</html>
