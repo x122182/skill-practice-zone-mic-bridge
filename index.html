@@ -30,9 +30,10 @@
     // A popup opened via window.open() is a genuine top-level browsing
     // context and is exempt from that restriction, so it can request the
     // mic and relay recorded clips back to the opener via postMessage.
-    // This page holds no secrets and does not log, store, or transmit
-    // audio anywhere else -- it only ever talks to window.opener. Adapted
-    // from the same proven pattern used by the sibling NHForm project.
+    // This page holds no secrets and does not log or store audio. It only
+    // talks to the opener when the opener's exact HTTPS origin was passed by
+    // the Apps Script app and matches an Apps Script hosting origin. Commands
+    // must come from that same origin and the original opener window.
     //
     // Listens once told to (START_LISTENING) -- a Web-Audio voice-activity
     // detector reports speaking/listening state for the opener app's UI
@@ -41,6 +42,7 @@
     // message (the opener's manual "Send" action) or the MAX_SEGMENT_MS
     // safety cap below.
     var opener = window.opener;
+    var openerOrigin = trustedOpenerOrigin_(new URLSearchParams(window.location.search).get('openerOrigin'));
     var stream = null;
     var audioContext = null;
     var analyser = null;
@@ -54,12 +56,32 @@
     var MAX_SEGMENT_MS = 180000; // 3 minutes -- safety cap on a single Talk/Send recording segment
     var VAD_POLL_MS = 50;
 
+    function trustedOpenerOrigin_(candidate) {
+      if (!candidate) return null;
+      try {
+        var parsed = new URL(candidate);
+        if (parsed.protocol !== 'https:' || parsed.origin !== candidate) return null;
+        var hostname = parsed.hostname.toLowerCase();
+        var isAppsScriptOrigin = hostname === 'script.google.com' ||
+          hostname === 'script.googleusercontent.com' ||
+          /^n-[a-z0-9-]+-script\.googleusercontent\.com$/.test(hostname) ||
+          /^n-[a-z0-9-]+\.script\.googleusercontent\.com$/.test(hostname);
+        return isAppsScriptOrigin ? parsed.origin : null;
+      } catch (e) {
+        return null;
+      }
+    }
+
     function setStatus(text) { document.getElementById('status').textContent = text; }
     function setDot(state) { document.getElementById('dot').className = state === 'idle' ? '' : state; }
-    function post(msg) { if (opener) opener.postMessage(msg, '*'); }
+    function post(msg) {
+      if (opener && openerOrigin) opener.postMessage(msg, openerOrigin);
+    }
 
     if (!opener) {
       setStatus('This page must be opened as a popup from Skill Practice Zone.');
+    } else if (!openerOrigin) {
+      setStatus('Open this page from Skill Practice Zone to use the microphone.');
     } else if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
       setStatus('Microphone access is not supported in this browser.');
       post({ type: 'BRIDGE_ERROR', message: 'getUserMedia unsupported in this browser' });
@@ -111,8 +133,9 @@
     }
 
     window.addEventListener('message', function(event) {
-      if (event.source !== opener) return;
-      var msg = event.data || {};
+      if (event.source !== opener || event.origin !== openerOrigin) return;
+      var msg = event.data;
+      if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
       if (msg.type === 'START_LISTENING') startListening_();
       else if (msg.type === 'STOP_LISTENING') finishSegment_();
       else if (msg.type === 'PAUSE_LISTENING') pauseListening_();
