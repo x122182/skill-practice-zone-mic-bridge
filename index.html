@@ -16,12 +16,14 @@
   #dot.speaking { background: #6ecb63; animation: pulse 1.1s ease-in-out infinite; }
   @keyframes pulse { 0%, 100% { box-shadow: 0 0 0 0 rgba(110,203,99,0.5); } 50% { box-shadow: 0 0 0 10px rgba(110,203,99,0); } }
   #status { font-size: 13px; opacity: 0.85; max-width: 280px; }
+  #realtime-audio { display: none; width: min(320px, 100%); }
 </style>
 </head>
 <body>
   <h1>🎙️ Skill Practice Zone — Mic Bridge</h1>
   <div id="dot"></div>
   <div id="status">Requesting microphone access&hellip;</div>
+  <audio id="realtime-audio" controls autoplay playsinline aria-label="Realtime model response"></audio>
   <script>
     // Generic, continuous-listening mic-capture bridge for the practice
     // page, whose own frame can't call getUserMedia() directly -- Google
@@ -52,6 +54,16 @@
     var segmentStartedAt = null;
     var vadTimer = null;
     var silenceThreshold = 0.02;
+    var realtimePeerConnection = null;
+    var realtimeDataChannel = null;
+    var realtimeModel = null;
+    var realtimeLimitTimer = null;
+    var realtimeAudio = document.getElementById('realtime-audio');
+    var REALTIME_MAX_MS = 90000;
+    var REALTIME_MODELS = [
+      'gpt-realtime-2.1', 'gpt-realtime-2', 'gpt-realtime-1.5',
+      'gpt-realtime-2.1-mini', 'gpt-realtime-mini'
+    ];
 
     var MAX_SEGMENT_MS = 180000; // 3 minutes -- safety cap on a single Talk/Send recording segment
     var VAD_POLL_MS = 50;
@@ -96,7 +108,7 @@
           source.connect(analyser);
           calibrateSilenceThreshold_(function() {
             setStatus('Microphone ready. Waiting for the app…');
-            post({ type: 'BRIDGE_READY' });
+            post({ type: 'BRIDGE_READY', capabilities: ['REALTIME_WEBRTC'] });
           });
         })
         .catch(function(err) {
@@ -136,11 +148,179 @@
       if (event.source !== opener || event.origin !== openerOrigin) return;
       var msg = event.data;
       if (!msg || typeof msg !== 'object' || Array.isArray(msg)) return;
-      if (msg.type === 'START_LISTENING') startListening_();
+      if (msg.type === 'START_REALTIME') startRealtime_(msg.model);
+      else if (msg.type === 'REALTIME_ANSWER') applyRealtimeAnswer_(msg);
+      else if (msg.type === 'STOP_REALTIME') stopRealtime_(false);
+      else if (msg.type === 'START_LISTENING') startListening_();
       else if (msg.type === 'STOP_LISTENING') finishSegment_();
       else if (msg.type === 'PAUSE_LISTENING') pauseListening_();
       else if (msg.type === 'CLOSE') window.close();
     });
+
+    function waitForIceGatheringComplete_(peerConnection) {
+      if (peerConnection.iceGatheringState === 'complete') return Promise.resolve();
+      return new Promise(function(resolve) {
+        var timeout;
+        function finish() {
+          if (timeout) clearTimeout(timeout);
+          peerConnection.removeEventListener('icegatheringstatechange', checkState);
+          resolve();
+        }
+        function checkState() {
+          if (peerConnection.iceGatheringState === 'complete') finish();
+        }
+        peerConnection.addEventListener('icegatheringstatechange', checkState);
+        timeout = setTimeout(finish, 8000);
+      });
+    }
+
+    function sendRealtimeEvent_(label, detail) {
+      if (!realtimeModel) return;
+      post({ type: 'REALTIME_EVENT', model: realtimeModel, label: label, detail: String(detail || '').slice(0, 220) });
+    }
+
+    function stopRealtime_(notifyOpener, message) {
+      var model = realtimeModel;
+      if (realtimeLimitTimer) clearTimeout(realtimeLimitTimer);
+      realtimeLimitTimer = null;
+      if (realtimeDataChannel) {
+        try { realtimeDataChannel.close(); } catch (e) { /* best effort */ }
+        realtimeDataChannel = null;
+      }
+      if (realtimePeerConnection) {
+        try { realtimePeerConnection.close(); } catch (e) { /* best effort */ }
+        realtimePeerConnection = null;
+      }
+      if (realtimeAudio) {
+        realtimeAudio.pause();
+        realtimeAudio.srcObject = null;
+        realtimeAudio.style.display = 'none';
+      }
+      realtimeModel = null;
+      if (stream) {
+        setDot('idle');
+        setStatus('Microphone ready. Waiting for the app…');
+      }
+      if (notifyOpener && model) {
+        post({ type: 'REALTIME_STOPPED', model: model, message: message || 'Realtime session stopped.' });
+      }
+    }
+
+    function realtimeFailure_(message) {
+      var model = realtimeModel;
+      if (model) post({ type: 'REALTIME_ERROR', model: model, message: String(message || 'Realtime session failed.').slice(0, 180) });
+      stopRealtime_(false);
+    }
+
+    function handleRealtimeEvent_(raw) {
+      var event;
+      try { event = JSON.parse(raw); } catch (e) { return; }
+      switch (event && event.type) {
+        case 'session.created':
+          sendRealtimeEvent_('Session ready');
+          break;
+        case 'input_audio_buffer.speech_started':
+          setDot('listening');
+          sendRealtimeEvent_('Listening', 'Speech detected from the microphone.');
+          break;
+        case 'input_audio_buffer.speech_stopped':
+          sendRealtimeEvent_('Thinking');
+          break;
+        case 'response.created':
+          setDot('speaking');
+          sendRealtimeEvent_('Model responding');
+          break;
+        case 'response.done':
+          setDot('listening');
+          sendRealtimeEvent_('Response finished');
+          break;
+        case 'conversation.item.input_audio_transcription.completed':
+          sendRealtimeEvent_('You said', event.transcript);
+          break;
+        case 'response.output_audio_transcript.done':
+          sendRealtimeEvent_('Model said', event.transcript);
+          break;
+        case 'error':
+          realtimeFailure_(event.error && event.error.message || 'The Realtime model reported an error.');
+          break;
+      }
+    }
+
+    function startRealtime_(modelId) {
+      if (REALTIME_MODELS.indexOf(modelId) === -1) {
+        post({ type: 'REALTIME_ERROR', model: modelId, message: 'That Realtime model is not allowed.' });
+        return;
+      }
+      if (!stream) {
+        post({ type: 'REALTIME_ERROR', model: modelId, message: 'Microphone access is not ready.' });
+        return;
+      }
+      if (realtimePeerConnection) {
+        post({ type: 'REALTIME_ERROR', model: modelId, message: 'A Realtime session is already active.' });
+        return;
+      }
+      var audioTracks = stream.getAudioTracks();
+      if (!audioTracks.length) {
+        post({ type: 'REALTIME_ERROR', model: modelId, message: 'No microphone audio track is available.' });
+        return;
+      }
+
+      realtimeModel = modelId;
+      setStatus('Setting up live audio…');
+      setDot('listening');
+      var peerConnection;
+      try {
+        peerConnection = new RTCPeerConnection();
+      } catch (error) {
+        realtimeFailure_('This browser could not create a WebRTC connection.');
+        return;
+      }
+      realtimePeerConnection = peerConnection;
+      peerConnection.addTrack(audioTracks[0], stream);
+      realtimeDataChannel = peerConnection.createDataChannel('oai-events');
+      realtimeDataChannel.addEventListener('open', function() { sendRealtimeEvent_('Event channel ready'); });
+      realtimeDataChannel.addEventListener('message', function(event) { handleRealtimeEvent_(event.data); });
+      peerConnection.addEventListener('track', function(event) {
+        if (realtimePeerConnection !== peerConnection || !realtimeAudio) return;
+        realtimeAudio.srcObject = event.streams && event.streams[0] || new MediaStream([event.track]);
+        realtimeAudio.style.display = 'block';
+        realtimeAudio.play().catch(function() { setStatus('Connected. Use the audio controls to hear the response.'); });
+      });
+      peerConnection.addEventListener('connectionstatechange', function() {
+        if (realtimePeerConnection !== peerConnection) return;
+        if (peerConnection.connectionState === 'connected') {
+          setStatus('Connected. Speak now; listen to the model here.');
+          setDot('listening');
+          post({ type: 'REALTIME_CONNECTED', model: modelId });
+          realtimeLimitTimer = setTimeout(function() {
+            stopRealtime_(true, 'The 90-second test limit was reached.');
+          }, REALTIME_MAX_MS);
+        } else if (peerConnection.connectionState === 'failed') {
+          realtimeFailure_('The WebRTC connection to FuelIX failed.');
+        }
+      });
+
+      peerConnection.createOffer()
+        .then(function(offer) { return peerConnection.setLocalDescription(offer); })
+        .then(function() { return waitForIceGatheringComplete_(peerConnection); })
+        .then(function() {
+          if (realtimePeerConnection !== peerConnection || !peerConnection.localDescription) return;
+          post({ type: 'REALTIME_OFFER', model: modelId, sdp: peerConnection.localDescription.sdp });
+        })
+        .catch(function() { realtimeFailure_('The browser could not create a WebRTC offer.'); });
+    }
+
+    function applyRealtimeAnswer_(message) {
+      var peerConnection = realtimePeerConnection;
+      if (!peerConnection || !realtimeModel || message.model !== realtimeModel) return;
+      if (typeof message.sdp !== 'string' || message.sdp.length > 50000 || message.sdp.indexOf('v=0') !== 0) {
+        realtimeFailure_('FuelIX returned an invalid Realtime answer.');
+        return;
+      }
+      peerConnection.setRemoteDescription({ type: 'answer', sdp: message.sdp })
+        .then(function() { if (realtimePeerConnection === peerConnection) setStatus('Finishing Realtime connection…'); })
+        .catch(function() { realtimeFailure_('The browser could not apply the Realtime answer.'); });
+    }
 
     function startListening_() {
       if (vadState !== 'idle' || !stream) return;
@@ -224,6 +404,7 @@
 
     window.addEventListener('beforeunload', function() {
       if (vadTimer) clearInterval(vadTimer);
+      stopRealtime_(true, 'The microphone popup closed.');
       if (stream) stream.getTracks().forEach(function(t) { t.stop(); });
     });
   </script>
